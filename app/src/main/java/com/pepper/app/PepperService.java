@@ -12,6 +12,9 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.media.AudioManager;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -41,7 +44,9 @@ public class PepperService extends Service {
     volatile String state = "off";
     volatile float level = 0f;
     volatile boolean alive = true;
-    boolean started = false, active = false;
+    boolean started = false;
+    volatile boolean active = false;
+    AudioRecord ar;
     long activeAt = 0, pauseUntil = 0;
     Handler h = new Handler(Looper.getMainLooper());
     SpeechRecognizer sr;
@@ -84,6 +89,7 @@ public class PepperService extends Service {
             ri.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
         }
         h.post(tick);
+        watch();
         return START_STICKY;
     }
 
@@ -118,9 +124,7 @@ public class PepperService extends Service {
             if (!ears) pauseUntil = now + 900;
             boolean want = ears && now > pauseUntil;
             if (sr != null) {
-                if (want && !active) {
-                    try { active = true; activeAt = now; sr.startListening(ri); } catch (Exception e) { active = false; }
-                } else if (!want && active) {
+                if (!want && active) {
                     try { sr.cancel(); } catch (Exception e) { }
                     active = false;
                 } else if (active && now - activeAt > 15000) {
@@ -157,6 +161,70 @@ public class PepperService extends Service {
             ArrayList<String> l = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             if (l != null && !l.isEmpty() && l.get(0).trim().length() > 0) send(l.get(0).trim());
         }
+    }
+
+    boolean ears() {
+        return (state.equals("listening") || state.equals("idle")) && SystemClock.uptimeMillis() > pauseUntil;
+    }
+
+    Runnable startRec = new Runnable() {
+        @Override public void run() {
+            if (!active && sr != null && ears()) {
+                active = true;
+                activeAt = SystemClock.uptimeMillis();
+                try { sr.startListening(ri); } catch (Exception e) { active = false; }
+            }
+        }
+    };
+
+    void nap(int ms) {
+        try { Thread.sleep(ms); } catch (Exception e) { }
+    }
+
+    void closeAr() {
+        if (ar != null) {
+            try { ar.stop(); } catch (Exception e) { }
+            try { ar.release(); } catch (Exception e) { }
+            ar = null;
+        }
+    }
+
+    void openAr() {
+        try {
+            int min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            AudioRecord a = new AudioRecord(MediaRecorder.AudioSource.MIC, 16000, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT, Math.max(min, 4096));
+            if (a.getState() != AudioRecord.STATE_INITIALIZED) { a.release(); return; }
+            a.startRecording();
+            ar = a;
+        } catch (Exception e) {
+            ar = null;
+        }
+    }
+
+    void watch() {
+        new Thread(() -> {
+            short[] buf = new short[800];
+            double floor = 500;
+            int hits = 0;
+            while (alive) {
+                if (active || sr == null || state.equals("off")) { closeAr(); hits = 0; nap(100); continue; }
+                if (ar == null) { openAr(); if (ar == null) { nap(500); continue; } }
+                int n = ar.read(buf, 0, buf.length);
+                if (n <= 0) { nap(20); continue; }
+                double sum = 0;
+                for (int i = 0; i < n; i++) sum += buf[i] * (double) buf[i];
+                double rms = Math.sqrt(sum / n);
+                if (ears() && rms > Math.max(900, floor * 3.0)) hits++;
+                else { hits = 0; floor = floor * 0.98 + rms * 0.02; }
+                if (hits >= 3) {
+                    hits = 0;
+                    closeAr();
+                    h.postDelayed(startRec, 60);
+                }
+            }
+            closeAr();
+        }).start();
     }
 
     void send(final String t) {
