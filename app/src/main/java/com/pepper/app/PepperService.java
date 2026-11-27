@@ -408,7 +408,18 @@ public class PepperService extends Service {
         Recognizer rf = null;
         try {
             rf = new Recognizer(model, 16000.0f);
-            for (short[] blk : ring) rf.acceptWaveForm(blk, blk.length);
+            Pattern tpx = Pattern.compile("\"text\"\\s*:\\s*\"([^\"]*)\"");
+            StringBuilder rep = new StringBuilder();
+            for (short[] blk : ring) {
+                if (rf.acceptWaveForm(blk, blk.length)) {
+                    Matcher mm = tpx.matcher(rf.getResult());
+                    if (mm.find()) rep.append(mm.group(1).trim()).append(' ');
+                }
+            }
+            Matcher m0 = tpx.matcher(rf.getFinalResult());
+            if (m0.find()) rep.append(m0.group(1).trim());
+            String got = rep.toString().trim();
+            if (got.length() > first.length() + 3) return got;
             short[] b = new short[1600];
             long end = SystemClock.uptimeMillis() + 5000;
             Pattern tp2 = Pattern.compile("\"text\"\\s*:\\s*\"([^\"]*)\"");
