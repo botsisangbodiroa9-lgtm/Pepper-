@@ -71,6 +71,8 @@ public class PepperService extends Service {
     volatile boolean voskWant = false;
     volatile long voskHold = 0;
     volatile int lvl = 0;
+    volatile long listenSince = 0;
+    String lastDbg = "";
     volatile String voskMsg = "-";
     volatile String modelMsg = "model loading";
 
@@ -126,6 +128,7 @@ public class PepperService extends Service {
         new Thread(() -> {
             Pattern p = Pattern.compile("\"state\":\\s*\"(\\w+)\"");
             Pattern q = Pattern.compile("\"level\":\\s*([0-9.]+)");
+            int bad = 0;
             while (alive) {
                 try {
                     HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/state").openConnection();
@@ -137,10 +140,11 @@ public class PepperService extends Service {
                     if (s == null) s = "";
                     Matcher m = p.matcher(s);
                     if (m.find()) state = m.group(1);
+                    bad = 0;
                     Matcher m2 = q.matcher(s);
                     level = m2.find() ? Float.parseFloat(m2.group(1)) : 0f;
                 } catch (Exception e) {
-                    state = "off";
+                    if (++bad >= 6) state = "off";
                 }
                 nap(300);
             }
@@ -169,12 +173,15 @@ public class PepperService extends Service {
                     pauseUntil = now + 300;
                 }
             }
-            voskWant = idle && model != null && now > voskHold;
+            if (listen) { if (listenSince == 0) listenSince = now; } else listenSince = 0;
+            boolean gMic = listen && listenSince != 0 && now - listenSince > 600;
+            voskWant = model != null && !st.equals("off") && !gMic;
             if (orb == null) makeOrb();
             if (orb != null) orb.setVisibility((appUp || idle || st.equals("off")) ? View.GONE : View.VISIBLE);
-            if (++tickN % 2 == 0) {
-                String dbg = "state " + st + " | google " + (active ? "on" : "off") + " err " + lastErr
-                    + " | wake " + (voskWant ? "on" : "off") + " level " + lvl + " | " + modelMsg + " / " + voskMsg;
+            String dbg = "state " + st + " | google " + (active ? "on" : "off") + " err " + lastErr
+                + " | wake " + (voskWant ? "on" : "off") + " | " + modelMsg + " / " + voskMsg;
+            if (!dbg.equals(lastDbg)) {
+                lastDbg = dbg;
                 try { ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(1, note(dbg)); } catch (Exception e) { }
             }
             h.postDelayed(this, 500);
@@ -325,6 +332,7 @@ public class PepperService extends Service {
             AudioRecord a = null;
             Recognizer r = null;
             double gain = 4.0;
+            boolean wasIdle = false;
             Pattern tp = Pattern.compile("\"(?:text|partial)\"\\s*:\\s*\"([^\"]*)\"");
             while (alive) {
                 if (!voskWant || model == null) {
@@ -366,12 +374,13 @@ public class PepperService extends Service {
                         int v = (int) (buf[i] * gain);
                         buf[i] = (short) Math.max(-32768, Math.min(32767, v));
                     }
+                    if (!state.equals("idle") || SystemClock.uptimeMillis() < voskHold) { wasIdle = false; continue; }
+                    if (!wasIdle) { r.reset(); wasIdle = true; }
                     String js = r.acceptWaveForm(buf, n) ? r.getResult() : r.getPartialResult();
                     Matcher m = tp.matcher(js == null ? "" : js);
                     String t = m.find() ? m.group(1).trim().toLowerCase() : "";
                     if (t.contains("pepper") || t.contains("dummy") || t.contains("buddy")) {
                         voskHold = SystemClock.uptimeMillis() + 3000;
-                        voskWant = false;
                         voskMsg = "heard: " + t;
                         send(t);
                         r.reset();
