@@ -21,7 +21,8 @@ import java.util.ArrayList;
 public class MainActivity extends Activity {
     static final String URL = "http://127.0.0.1:8765";
     WebView w;
-    boolean asked = false, askedOverlay = false;
+    boolean asked = false, askedOverlay = false, askedTermux = false;
+    long lastStart = 0;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -32,6 +33,7 @@ public class MainActivity extends Activity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
+        s.setUserAgentString(s.getUserAgentString() + " Pepper-App");
         w.setWebViewClient(new WebViewClient() {
             @Override public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
                 if (r.isForMainFrame()) v.postDelayed(() -> v.loadUrl(URL), 1500);
@@ -51,6 +53,11 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         PepperService.appUp = true;
+        if (checkSelfPermission("com.termux.permission.RUN_COMMAND") != PackageManager.PERMISSION_GRANTED && !askedTermux) {
+            askedTermux = true;
+            requestPermissions(new String[]{"com.termux.permission.RUN_COMMAND"}, 2);
+            return;
+        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             if (!asked) {
                 asked = true;
@@ -67,6 +74,31 @@ public class MainActivity extends Activity {
         }
         Intent i = new Intent(this, PepperService.class);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
+        startPepper();
+    }
+
+    void startPepper() {
+        if (checkSelfPermission("com.termux.permission.RUN_COMMAND") != PackageManager.PERMISSION_GRANTED) return;
+        if (System.currentTimeMillis() - lastStart < 15000) return;
+        lastStart = System.currentTimeMillis();
+        new Thread(() -> {
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(URL + "/state").openConnection();
+                c.setConnectTimeout(700);
+                c.setReadTimeout(700);
+                if (c.getResponseCode() == 200) return;
+            } catch (Exception e) { }
+            try {
+                Intent i = new Intent();
+                i.setClassName("com.termux", "com.termux.app.RunCommandService");
+                i.setAction("com.termux.RUN_COMMAND");
+                i.putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/bash");
+                i.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", new String[]{"/data/data/com.termux/files/home/pepper_bg.sh"});
+                i.putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/com.termux/files/home");
+                i.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
+                startService(i);
+            } catch (Exception e) { }
+        }).start();
     }
 
     @Override protected void onPause() {
