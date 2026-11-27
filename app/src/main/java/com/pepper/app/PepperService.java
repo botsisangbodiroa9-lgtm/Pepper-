@@ -30,6 +30,15 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import org.vosk.Model;
+import org.vosk.Recognizer;
+import org.vosk.android.SpeechService;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
@@ -47,6 +56,11 @@ public class PepperService extends Service {
     boolean started = false;
     volatile boolean active = false;
     AudioRecord ar;
+    volatile Model model;
+    Recognizer rec;
+    SpeechService ss;
+    volatile boolean voskOn = false;
+    long voskHold = 0;
     long activeAt = 0, pauseUntil = 0;
     Handler h = new Handler(Looper.getMainLooper());
     SpeechRecognizer sr;
@@ -92,6 +106,7 @@ public class PepperService extends Service {
             ri.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
         }
         h.post(tick);
+        prepModel();
         return START_STICKY;
     }
 
@@ -122,7 +137,7 @@ public class PepperService extends Service {
         @Override public void run() {
             if (!alive) return;
             long now = SystemClock.uptimeMillis();
-            boolean ears = state.equals("listening") || state.equals("idle");
+            boolean ears = state.equals("listening");
             if (!ears) pauseUntil = now + 900;
             boolean want = ears && now > pauseUntil;
             if (sr != null) {
@@ -130,12 +145,19 @@ public class PepperService extends Service {
                     active = true;
                     activeAt = now;
                     try { sr.startListening(ri); } catch (Exception e) { active = false; }
+                } else if (active && (state.equals("idle") || state.equals("off"))) {
+                    try { sr.cancel(); } catch (Exception e) { }
+                    active = false;
+                    pauseUntil = now + 300;
                 } else if (active && now - activeAt > 180000) {
                     try { sr.cancel(); } catch (Exception e) { }
                     active = false;
                     pauseUntil = now + 300;
                 }
             }
+            boolean idle = state.equals("idle");
+            if (idle && model != null && !voskOn && now > voskHold) startVosk();
+            else if (!idle && voskOn) stopVosk();
             if (orb == null) makeOrb();
             if (orb != null) orb.setVisibility((appUp || state.equals("idle") || state.equals("off")) ? View.GONE : View.VISIBLE);
             h.postDelayed(this, 500);
@@ -173,6 +195,125 @@ public class PepperService extends Service {
         public void onEndOfSegmentedSession() {
             active = false;
             pauseUntil = SystemClock.uptimeMillis() + 200;
+        }
+    }
+
+    boolean ears() {
+        return state.equals("listening") && SystemClock.uptimeMillis() > pauseUntil;
+    }
+
+    void nap(int ms) {
+        try { Thread.sleep(ms); } catch (Exception e) { }
+    }
+
+    static final String GRAMMAR = "[\"hey pepper\", \"pepper\", \"hey dummy\", \"dummy\", \"hey buddy\", \"buddy\", \"hey\", \"[unk]\"]";
+
+    void deleteDir(File d) {
+        File[] fs = d.listFiles();
+        if (fs != null) for (File x : fs) { if (x.isDirectory()) deleteDir(x); else x.delete(); }
+        d.delete();
+    }
+
+    void download(File dir) throws Exception {
+        File tmp = new File(getFilesDir(), "m.zip");
+        HttpURLConnection c = (HttpURLConnection) new URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip").openConnection();
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(30000);
+        InputStream in = c.getInputStream();
+        FileOutputStream out = new FileOutputStream(tmp);
+        byte[] b = new byte[65536];
+        int n;
+        while ((n = in.read(b)) > 0) out.write(b, 0, n);
+        out.close();
+        in.close();
+        deleteDir(dir);
+        dir.mkdirs();
+        String root = dir.getCanonicalPath() + File.separator;
+        ZipInputStream z = new ZipInputStream(new FileInputStream(tmp));
+        ZipEntry ze;
+        while ((ze = z.getNextEntry()) != null) {
+            String name = ze.getName();
+            int i = name.indexOf('/');
+            if (i < 0) continue;
+            name = name.substring(i + 1);
+            if (name.isEmpty()) continue;
+            File f = new File(dir, name);
+            if (!f.getCanonicalPath().startsWith(root)) continue;
+            if (ze.isDirectory()) { f.mkdirs(); continue; }
+            f.getParentFile().mkdirs();
+            FileOutputStream o = new FileOutputStream(f);
+            int k;
+            while ((k = z.read(b)) > 0) o.write(b, 0, k);
+            o.close();
+        }
+        z.close();
+        tmp.delete();
+        new FileOutputStream(new File(dir, "ok")).close();
+    }
+
+    void prepModel() {
+        new Thread(() -> {
+            File dir = new File(getFilesDir(), "model");
+            int fails = 0;
+            while (alive && model == null && fails < 2) {
+                try {
+                    if (!new File(dir, "ok").exists()) download(dir);
+                } catch (Exception e) {
+                    nap(30000);
+                    continue;
+                }
+                try {
+                    model = new Model(dir.getAbsolutePath());
+                } catch (Throwable t) {
+                    fails++;
+                    deleteDir(dir);
+                    nap(20000);
+                }
+            }
+        }).start();
+    }
+
+    void startVosk() {
+        if (model == null || voskOn) return;
+        try {
+            if (rec == null) rec = new Recognizer(model, 16000.0f, GRAMMAR);
+            else rec.reset();
+            ss = new SpeechService(rec, 16000.0f);
+            ss.startListening(new VoskEar());
+            voskOn = true;
+        } catch (Throwable e) {
+            voskOn = false;
+            ss = null;
+        }
+    }
+
+    void stopVosk() {
+        voskOn = false;
+        try { if (ss != null) { ss.stop(); ss.shutdown(); } } catch (Throwable e) { }
+        ss = null;
+    }
+
+    void wake(String t) {
+        voskOn = false;
+        voskHold = SystemClock.uptimeMillis() + 3000;
+        String clean = t.replace("[unk]", "").trim();
+        h.post(() -> stopVosk());
+        send(clean.isEmpty() ? "hey pepper" : clean);
+    }
+
+    class VoskEar implements org.vosk.android.RecognitionListener {
+        public void onPartialResult(String j) { check(j, "partial"); }
+        public void onResult(String j) { check(j, "text"); }
+        public void onFinalResult(String j) { check(j, "text"); }
+        public void onError(Exception e) { }
+        public void onTimeout() { }
+        void check(String j, String key) {
+            if (!voskOn) return;
+            Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"").matcher(j == null ? "" : j);
+            String t = m.find() ? m.group(1).trim().toLowerCase() : "";
+            if (t.length() == 0 || t.equals("[unk]")) return;
+            boolean strong = t.contains("pepper") || t.contains("dummy") || t.contains("buddy");
+            if (strong || (key.equals("text") && t.contains("hey"))) wake(t);
         }
     }
 
@@ -317,6 +458,7 @@ public class PepperService extends Service {
 
     @Override public void onDestroy() {
         alive = false;
+        stopVosk();
         try { if (sr != null) sr.destroy(); } catch (Exception e) { }
         try { if (orb != null) wm.removeView(orb); } catch (Exception e) { }
         loud();
