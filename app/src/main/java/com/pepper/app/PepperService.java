@@ -11,8 +11,8 @@ import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
-import android.media.AudioManager;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Build;
@@ -34,11 +34,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-import org.vosk.Model;
-import org.vosk.Recognizer;
-import org.vosk.android.SpeechService;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
@@ -46,22 +41,23 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import org.vosk.Model;
+import org.vosk.Recognizer;
 
 public class PepperService extends Service {
     static final String BASE = "http://127.0.0.1:8765";
+    static final String GRAMMAR = "[\"hey pepper\", \"pepper\", \"hey dummy\", \"dummy\", \"hey buddy\", \"buddy\", \"[unk]\"]";
     static volatile boolean appUp = false;
     volatile String state = "off";
     volatile float level = 0f;
     volatile boolean alive = true;
     boolean started = false;
     volatile boolean active = false;
-    AudioRecord ar;
-    volatile Model model;
-    Recognizer rec;
-    SpeechService ss;
-    volatile boolean voskOn = false;
-    long voskHold = 0;
     long activeAt = 0, pauseUntil = 0;
+    volatile int lastErr = 0;
+    int tickN = 0;
     Handler h = new Handler(Looper.getMainLooper());
     SpeechRecognizer sr;
     Intent ri;
@@ -69,24 +65,35 @@ public class PepperService extends Service {
     OrbView orb;
     WindowManager.LayoutParams lp;
     AudioManager am;
+    PendingIntent pi;
     int[] streams = {AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM};
+    volatile Model model;
+    volatile boolean voskWant = false;
+    volatile long voskHold = 0;
+    volatile int lvl = 0;
+    volatile String voskMsg = "-";
+    volatile String modelMsg = "model loading";
 
     @Override public IBinder onBind(Intent i) { return null; }
+
+    Notification note(String txt) {
+        if (Build.VERSION.SDK_INT >= 26)
+            return new Notification.Builder(this, "pepper").setContentTitle("Pepper").setContentText(txt)
+                .setStyle(new Notification.BigTextStyle().bigText(txt))
+                .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(pi).setOnlyAlertOnce(true).build();
+        return new Notification.Builder(this).setContentTitle("Pepper").setContentText(txt)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(pi).build();
+    }
 
     @Override public int onStartCommand(Intent in, int f, int id) {
         if (started) return START_STICKY;
         started = true;
-        PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
-        Notification n;
+        pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel ch = new NotificationChannel("pepper", "Pepper", NotificationManager.IMPORTANCE_LOW);
             getSystemService(NotificationManager.class).createNotificationChannel(ch);
-            n = new Notification.Builder(this, "pepper").setContentTitle("Pepper").setContentText("Here with you")
-                .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(pi).build();
-        } else {
-            n = new Notification.Builder(this).setContentTitle("Pepper").setContentText("Here with you")
-                .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(pi).build();
         }
+        Notification n = note("starting");
         if (Build.VERSION.SDK_INT >= 29)
             startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
         else startForeground(1, n);
@@ -101,18 +108,24 @@ public class PepperService extends Service {
             ri.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-ZA");
             ri.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
             ri.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
-            ri.putExtra("android.speech.extra.SEGMENTED_SESSION", true);
             ri.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
-            ri.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+        } else {
+            lastErr = -1;
         }
-        h.post(tick);
         prepModel();
+        voskThread();
+        h.post(tick);
         return START_STICKY;
+    }
+
+    void nap(int ms) {
+        try { Thread.sleep(ms); } catch (Exception e) { }
     }
 
     void poll() {
         new Thread(() -> {
             Pattern p = Pattern.compile("\"state\":\\s*\"(\\w+)\"");
+            Pattern q = Pattern.compile("\"level\":\\s*([0-9.]+)");
             while (alive) {
                 try {
                     HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/state").openConnection();
@@ -121,14 +134,15 @@ public class PepperService extends Service {
                     BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()));
                     String s = r.readLine();
                     r.close();
-                    Matcher m = p.matcher(s == null ? "" : s);
+                    if (s == null) s = "";
+                    Matcher m = p.matcher(s);
                     if (m.find()) state = m.group(1);
-                    Matcher m2 = Pattern.compile("\"level\":\\s*([0-9.]+)").matcher(s == null ? "" : s);
+                    Matcher m2 = q.matcher(s);
                     level = m2.find() ? Float.parseFloat(m2.group(1)) : 0f;
                 } catch (Exception e) {
                     state = "off";
                 }
-                try { Thread.sleep(300); } catch (Exception e) { }
+                nap(300);
             }
         }).start();
     }
@@ -137,29 +151,32 @@ public class PepperService extends Service {
         @Override public void run() {
             if (!alive) return;
             long now = SystemClock.uptimeMillis();
-            boolean ears = state.equals("listening");
-            if (!ears) pauseUntil = now + 900;
-            boolean want = ears && now > pauseUntil;
+            String st = state;
+            boolean listen = st.equals("listening");
+            boolean idle = st.equals("idle");
+            if (!listen) pauseUntil = now + 900;
             if (sr != null) {
-                if (!active && ears()) {
+                if (listen && !active && now > pauseUntil) {
                     active = true;
                     activeAt = now;
                     try { sr.startListening(ri); } catch (Exception e) { active = false; }
-                } else if (active && (state.equals("idle") || state.equals("off"))) {
+                } else if (!listen && active) {
                     try { sr.cancel(); } catch (Exception e) { }
                     active = false;
-                    pauseUntil = now + 300;
-                } else if (active && now - activeAt > 180000) {
+                } else if (active && now - activeAt > 15000) {
                     try { sr.cancel(); } catch (Exception e) { }
                     active = false;
                     pauseUntil = now + 300;
                 }
             }
-            boolean idle = state.equals("idle");
-            if (idle && model != null && !voskOn && now > voskHold) startVosk();
-            else if (!idle && voskOn) stopVosk();
+            voskWant = idle && model != null && now > voskHold;
             if (orb == null) makeOrb();
-            if (orb != null) orb.setVisibility((appUp || state.equals("idle") || state.equals("off")) ? View.GONE : View.VISIBLE);
+            if (orb != null) orb.setVisibility((appUp || idle || st.equals("off")) ? View.GONE : View.VISIBLE);
+            if (++tickN % 2 == 0) {
+                String dbg = "state " + st + " | google " + (active ? "on" : "off") + " err " + lastErr
+                    + " | wake " + (voskWant ? "on" : "off") + " level " + lvl + " | " + modelMsg + " / " + voskMsg;
+                try { ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(1, note(dbg)); } catch (Exception e) { }
+            }
             h.postDelayed(this, 500);
         }
     };
@@ -174,6 +191,7 @@ public class PepperService extends Service {
         public void onEvent(int t, Bundle b) { }
         public void onError(int e) {
             active = false;
+            lastErr = e;
             long now = SystemClock.uptimeMillis();
             if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
                 try { sr.cancel(); } catch (Exception x) { }
@@ -181,32 +199,54 @@ public class PepperService extends Service {
             } else pauseUntil = now + 300;
         }
         public void onResults(Bundle b) {
-            boolean ok = ears();
+            boolean ok = state.equals("listening");
             active = false;
+            lastErr = 0;
             pauseUntil = SystemClock.uptimeMillis() + 300;
             ArrayList<String> l = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             if (ok && l != null && !l.isEmpty() && l.get(0).trim().length() > 0) send(l.get(0).trim());
         }
-        public void onSegmentResults(Bundle b) {
-            boolean ok = ears();
-            ArrayList<String> l = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-            if (ok && l != null && !l.isEmpty() && l.get(0).trim().length() > 0) send(l.get(0).trim());
+    }
+
+    void send(final String t) {
+        new Thread(() -> {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/hear").openConnection();
+                c.setRequestMethod("POST");
+                c.setDoOutput(true);
+                c.setConnectTimeout(1500);
+                byte[] b = t.getBytes("UTF-8");
+                c.setFixedLengthStreamingMode(b.length);
+                OutputStream o = c.getOutputStream();
+                o.write(b);
+                o.close();
+                c.getResponseCode();
+                c.disconnect();
+            } catch (Exception e) { }
+        }).start();
+    }
+
+    void quiet() {
+        SharedPreferences sp = getSharedPreferences("p", 0);
+        for (int i = 0; i < streams.length; i++) {
+            try {
+                if (!sp.contains("v" + i)) sp.edit().putInt("v" + i, am.getStreamVolume(streams[i])).apply();
+                am.setStreamVolume(streams[i], 0, 0);
+            } catch (Exception e) { }
         }
-        public void onEndOfSegmentedSession() {
-            active = false;
-            pauseUntil = SystemClock.uptimeMillis() + 200;
+    }
+
+    void loud() {
+        SharedPreferences sp = getSharedPreferences("p", 0);
+        for (int i = 0; i < streams.length; i++) {
+            try {
+                if (sp.contains("v" + i)) {
+                    am.setStreamVolume(streams[i], sp.getInt("v" + i, 3), 0);
+                    sp.edit().remove("v" + i).apply();
+                }
+            } catch (Exception e) { }
         }
     }
-
-    boolean ears() {
-        return state.equals("listening") && SystemClock.uptimeMillis() > pauseUntil;
-    }
-
-    void nap(int ms) {
-        try { Thread.sleep(ms); } catch (Exception e) { }
-    }
-
-    static final String GRAMMAR = "[\"hey pepper\", \"pepper\", \"hey dummy\", \"dummy\", \"hey buddy\", \"buddy\", \"hey\", \"[unk]\"]";
 
     void deleteDir(File d) {
         File[] fs = d.listFiles();
@@ -257,15 +297,21 @@ public class PepperService extends Service {
             int fails = 0;
             while (alive && model == null && fails < 2) {
                 try {
-                    if (!new File(dir, "ok").exists()) download(dir);
+                    if (!new File(dir, "ok").exists()) {
+                        modelMsg = "downloading model";
+                        download(dir);
+                    }
                 } catch (Exception e) {
+                    modelMsg = "download failed, retrying";
                     nap(30000);
                     continue;
                 }
                 try {
                     model = new Model(dir.getAbsolutePath());
+                    modelMsg = "model ready";
                 } catch (Throwable t) {
                     fails++;
+                    modelMsg = "model error " + t.getClass().getSimpleName();
                     deleteDir(dir);
                     nap(20000);
                 }
@@ -273,88 +319,74 @@ public class PepperService extends Service {
         }).start();
     }
 
-    void startVosk() {
-        if (model == null || voskOn) return;
-        try {
-            if (rec == null) rec = new Recognizer(model, 16000.0f, GRAMMAR);
-            else rec.reset();
-            ss = new SpeechService(rec, 16000.0f);
-            ss.startListening(new VoskEar());
-            voskOn = true;
-        } catch (Throwable e) {
-            voskOn = false;
-            ss = null;
-        }
-    }
-
-    void stopVosk() {
-        voskOn = false;
-        try { if (ss != null) { ss.stop(); ss.shutdown(); } } catch (Throwable e) { }
-        ss = null;
-    }
-
-    void wake(String t) {
-        voskOn = false;
-        voskHold = SystemClock.uptimeMillis() + 3000;
-        String clean = t.replace("[unk]", "").trim();
-        h.post(() -> stopVosk());
-        send(clean.isEmpty() ? "hey pepper" : clean);
-    }
-
-    class VoskEar implements org.vosk.android.RecognitionListener {
-        public void onPartialResult(String j) { check(j, "partial"); }
-        public void onResult(String j) { check(j, "text"); }
-        public void onFinalResult(String j) { check(j, "text"); }
-        public void onError(Exception e) { }
-        public void onTimeout() { }
-        void check(String j, String key) {
-            if (!voskOn) return;
-            Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"").matcher(j == null ? "" : j);
-            String t = m.find() ? m.group(1).trim().toLowerCase() : "";
-            if (t.length() == 0 || t.equals("[unk]")) return;
-            boolean strong = t.contains("pepper") || t.contains("dummy") || t.contains("buddy");
-            if (strong || (key.equals("text") && t.contains("hey"))) wake(t);
-        }
-    }
-
-    void send(final String t) {
+    void voskThread() {
         new Thread(() -> {
-            try {
-                HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/hear").openConnection();
-                c.setRequestMethod("POST");
-                c.setDoOutput(true);
-                c.setConnectTimeout(1500);
-                byte[] b = t.getBytes("UTF-8");
-                c.setFixedLengthStreamingMode(b.length);
-                OutputStream o = c.getOutputStream();
-                o.write(b);
-                o.close();
-                c.getResponseCode();
-                c.disconnect();
-            } catch (Exception e) { }
-        }).start();
-    }
-
-    void quiet() {
-        SharedPreferences sp = getSharedPreferences("p", 0);
-        for (int i = 0; i < streams.length; i++) {
-            try {
-                if (!sp.contains("v" + i)) sp.edit().putInt("v" + i, am.getStreamVolume(streams[i])).apply();
-                am.setStreamVolume(streams[i], 0, 0);
-            } catch (Exception e) { }
-        }
-    }
-
-    void loud() {
-        SharedPreferences sp = getSharedPreferences("p", 0);
-        for (int i = 0; i < streams.length; i++) {
-            try {
-                if (sp.contains("v" + i)) {
-                    am.setStreamVolume(streams[i], sp.getInt("v" + i, 3), 0);
-                    sp.edit().remove("v" + i).apply();
+            short[] buf = new short[1600];
+            AudioRecord a = null;
+            Recognizer r = null;
+            double gain = 4.0;
+            Pattern tp = Pattern.compile("\"(?:text|partial)\"\\s*:\\s*\"([^\"]*)\"");
+            while (alive) {
+                if (!voskWant || model == null) {
+                    if (a != null) {
+                        try { a.stop(); } catch (Exception e) { }
+                        try { a.release(); } catch (Exception e) { }
+                        a = null;
+                    }
+                    lvl = 0;
+                    nap(100);
+                    continue;
                 }
-            } catch (Exception e) { }
-        }
+                try {
+                    if (r == null) r = new Recognizer(model, 16000.0f, GRAMMAR);
+                    if (a == null) {
+                        int min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                        AudioRecord x = new AudioRecord(MediaRecorder.AudioSource.MIC, 16000, AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT, Math.max(min, 8192));
+                        if (x.getState() != AudioRecord.STATE_INITIALIZED) {
+                            x.release();
+                            voskMsg = "mic busy";
+                            nap(300);
+                            continue;
+                        }
+                        x.startRecording();
+                        a = x;
+                        r.reset();
+                        voskMsg = "listening";
+                    }
+                    int n = a.read(buf, 0, buf.length);
+                    if (n <= 0) { nap(20); continue; }
+                    double sum = 0;
+                    for (int i = 0; i < n; i++) sum += buf[i] * (double) buf[i];
+                    double rms = Math.sqrt(sum / n);
+                    lvl = (int) rms;
+                    double want = rms < 1 ? gain : Math.max(1.0, Math.min(14.0, 2500.0 / rms));
+                    gain = gain * 0.9 + want * 0.1;
+                    for (int i = 0; i < n; i++) {
+                        int v = (int) (buf[i] * gain);
+                        buf[i] = (short) Math.max(-32768, Math.min(32767, v));
+                    }
+                    String js = r.acceptWaveForm(buf, n) ? r.getResult() : r.getPartialResult();
+                    Matcher m = tp.matcher(js == null ? "" : js);
+                    String t = m.find() ? m.group(1).trim().toLowerCase() : "";
+                    if (t.contains("pepper") || t.contains("dummy") || t.contains("buddy")) {
+                        voskHold = SystemClock.uptimeMillis() + 3000;
+                        voskWant = false;
+                        voskMsg = "heard: " + t;
+                        send(t);
+                        r.reset();
+                    }
+                } catch (Throwable e) {
+                    voskMsg = "error " + e.getClass().getSimpleName();
+                    nap(500);
+                }
+            }
+            if (a != null) {
+                try { a.stop(); } catch (Exception e) { }
+                try { a.release(); } catch (Exception e) { }
+            }
+            try { if (r != null) r.close(); } catch (Throwable e) { }
+        }).start();
     }
 
     void makeOrb() {
@@ -458,7 +490,6 @@ public class PepperService extends Service {
 
     @Override public void onDestroy() {
         alive = false;
-        stopVosk();
         try { if (sr != null) sr.destroy(); } catch (Exception e) { }
         try { if (orb != null) wm.removeView(orb); } catch (Exception e) { }
         loud();
