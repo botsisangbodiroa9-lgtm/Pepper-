@@ -116,6 +116,7 @@ public class PepperService extends Service {
         }
         prepModel();
         voskThread();
+        interruptThread();
         h.post(tick);
         return START_STICKY;
     }
@@ -438,6 +439,115 @@ public class PepperService extends Service {
         }
     }
 
+    String grabRest(AudioRecord a, double gain, java.util.ArrayDeque<short[]> ring) {
+        Recognizer rf = null;
+        try {
+            rf = new Recognizer(model, 16000.0f);
+            for (short[] blk : ring) rf.acceptWaveForm(blk, blk.length);
+            short[] b = new short[1600];
+            long end = SystemClock.uptimeMillis() + 5000;
+            Pattern tp2 = Pattern.compile("\"text\"\\s*:\\s*\"([^\"]*)\"");
+            String text = "";
+            while (SystemClock.uptimeMillis() < end && alive) {
+                int n = a.read(b, 0, b.length);
+                if (n <= 0) continue;
+                for (int i = 0; i < n; i++) {
+                    int v = (int) (b[i] * gain);
+                    b[i] = (short) Math.max(-32768, Math.min(32767, v));
+                }
+                if (rf.acceptWaveForm(b, n)) {
+                    Matcher m = tp2.matcher(rf.getResult());
+                    text = m.find() ? m.group(1).trim() : "";
+                    break;
+                }
+            }
+            if (text.isEmpty()) {
+                Matcher m = tp2.matcher(rf.getFinalResult());
+                text = m.find() ? m.group(1).trim() : "";
+            }
+            return text;
+        } catch (Throwable e) {
+            return "";
+        } finally {
+            try { if (rf != null) rf.close(); } catch (Throwable x) { }
+        }
+    }
+
+    void interruptThread() {
+        new Thread(() -> {
+            short[] buf = new short[1600];
+            AudioRecord a = null;
+            Recognizer r = null;
+            double gain = 3.0;
+            long since = 0, hold = 0;
+            java.util.ArrayDeque<short[]> ring = new java.util.ArrayDeque<>();
+            Pattern tp = Pattern.compile("\"(?:text|partial)\"\\s*:\\s*\"([^\"]*)\"");
+            while (alive) {
+                if (!state.equals("talking") || model == null) {
+                    if (a != null) {
+                        try { a.stop(); } catch (Exception e) { }
+                        try { a.release(); } catch (Exception e) { }
+                        a = null;
+                    }
+                    since = 0;
+                    nap(100);
+                    continue;
+                }
+                try {
+                    long now = SystemClock.uptimeMillis();
+                    if (since == 0) since = now;
+                    if (r == null) r = new Recognizer(model, 16000.0f, "[\"stop\", \"wait\", \"hold on\", \"hang on\", \"pepper\", \"excuse me\", \"one second\", \"[unk]\"]");
+                    if (a == null) {
+                        int min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                        AudioRecord x = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT, Math.max(min, 8192));
+                        if (x.getState() != AudioRecord.STATE_INITIALIZED) {
+                            x.release();
+                            nap(300);
+                            continue;
+                        }
+                        x.startRecording();
+                        a = x;
+                        r.reset();
+                        ring.clear();
+                    }
+                    int n = a.read(buf, 0, buf.length);
+                    if (n <= 0) { nap(20); continue; }
+                    double sum = 0;
+                    for (int i = 0; i < n; i++) sum += buf[i] * (double) buf[i];
+                    double rms = Math.sqrt(sum / n);
+                    double want = rms < 1 ? gain : Math.max(1.0, Math.min(14.0, 2500.0 / rms));
+                    gain = gain * 0.9 + want * 0.1;
+                    for (int i = 0; i < n; i++) {
+                        int v = (int) (buf[i] * gain);
+                        buf[i] = (short) Math.max(-32768, Math.min(32767, v));
+                    }
+                    short[] cp = new short[n];
+                    System.arraycopy(buf, 0, cp, 0, n);
+                    ring.addLast(cp);
+                    if (ring.size() > 12) ring.removeFirst();
+                    String js = r.acceptWaveForm(buf, n) ? r.getResult() : r.getPartialResult();
+                    Matcher m = tp.matcher(js == null ? "" : js);
+                    String t = m.find() ? m.group(1).trim().toLowerCase() : "";
+                    if (t.length() > 0 && !t.equals("[unk]") && now >= hold && now - since >= 800) {
+                        hold = now + 2500;
+                        send("__interrupt__");
+                        String rest = grabRest(a, gain, ring);
+                        if (rest.trim().split("\\s+").length >= 3) send(rest.trim());
+                        r.reset();
+                    }
+                } catch (Throwable e) {
+                    nap(500);
+                }
+            }
+            if (a != null) {
+                try { a.stop(); } catch (Exception e) { }
+                try { a.release(); } catch (Exception e) { }
+            }
+            try { if (r != null) r.close(); } catch (Throwable e) { }
+        }).start();
+    }
+
     void makeOrb() {
         try {
             if (!Settings.canDrawOverlays(this)) return;
@@ -526,7 +636,9 @@ public class PepperService extends Service {
                     }
                     return true;
                 case MotionEvent.ACTION_UP:
-                    if (!moved) {
+                    if (!moved && state.equals("talking")) {
+                        send("__interrupt__");
+                    } else if (!moved) {
                         Intent i = new Intent(PepperService.this, MainActivity.class);
                         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         startActivity(i);
