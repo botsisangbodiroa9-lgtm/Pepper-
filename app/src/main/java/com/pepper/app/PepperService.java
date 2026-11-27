@@ -130,7 +130,7 @@ public class PepperService extends Service {
                 }
             }
             if (orb == null) makeOrb();
-            if (orb != null) orb.setVisibility(appUp ? View.GONE : View.VISIBLE);
+            if (orb != null) orb.setVisibility((appUp || state.equals("idle") || state.equals("off")) ? View.GONE : View.VISIBLE);
             h.postDelayed(this, 500);
         }
     };
