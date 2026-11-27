@@ -39,6 +39,7 @@ public class PepperService extends Service {
     static final String BASE = "http://127.0.0.1:8765";
     static volatile boolean appUp = false;
     volatile String state = "off";
+    volatile float level = 0f;
     volatile boolean alive = true;
     boolean started = false, active = false;
     long activeAt = 0, pauseUntil = 0;
@@ -99,6 +100,8 @@ public class PepperService extends Service {
                     r.close();
                     Matcher m = p.matcher(s == null ? "" : s);
                     if (m.find()) state = m.group(1);
+                    Matcher m2 = Pattern.compile("\"level\":\\s*([0-9.]+)").matcher(s == null ? "" : s);
+                    level = m2.find() ? Float.parseFloat(m2.group(1)) : 0f;
                 } catch (Exception e) {
                     state = "off";
                 }
@@ -201,7 +204,7 @@ public class PepperService extends Service {
             if (!Settings.canDrawOverlays(this)) return;
             wm = (WindowManager) getSystemService(WINDOW_SERVICE);
             orb = new OrbView(this);
-            int sz = (int) (76 * getResources().getDisplayMetrics().density);
+            int sz = (int) (110 * getResources().getDisplayMetrics().density);
             lp = new WindowManager.LayoutParams(sz, sz,
                 Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
@@ -220,25 +223,53 @@ public class PepperService extends Service {
         int sx, sy;
         float dx, dy;
         boolean moved;
+        final int N = 150;
+        float[] px = new float[N], py = new float[N], pz = new float[N];
+        int[] pc = new int[N];
+        float lv = 0f;
+        float ang = 0f;
+        long last = 0;
 
-        OrbView(Context c) { super(c); }
+        OrbView(Context c) {
+            super(c);
+            java.util.Random rd = new java.util.Random(7);
+            int[] pal = {0xFF8FB4FF, 0xFFB69CFF, 0xFFE79BC8, 0xFF9FE3B8, 0xFF7FD3F0};
+            for (int i = 0; i < N; i++) {
+                double u = rd.nextDouble() * 2 - 1, a = rd.nextDouble() * Math.PI * 2;
+                double rr = Math.cbrt(rd.nextDouble());
+                double sq = Math.sqrt(1 - u * u);
+                px[i] = (float) (rr * sq * Math.cos(a));
+                py[i] = (float) (rr * u);
+                pz[i] = (float) (rr * sq * Math.sin(a));
+                int idx = (px[i] < -0.2f) ? (py[i] < 0 ? 0 : 1) : ((px[i] > 0.2f) ? (py[i] < 0 ? 2 : 3) : 4);
+                pc[i] = pal[idx];
+            }
+        }
 
         @Override protected void onDraw(Canvas c) {
-            float t = SystemClock.uptimeMillis() / 1000f;
+            long now = SystemClock.uptimeMillis();
+            float dt = last == 0 ? 0.04f : (now - last) / 1000f;
+            last = now;
+            float t = now / 1000f;
             String s = state;
-            int col = 0xFF607D8B;
-            float k = 0f;
-            if (s.equals("listening")) { col = 0xFF4FC3F7; k = (float) Math.sin(t * 2.2f); }
-            else if (s.equals("thinking")) { col = 0xFFFFB74D; k = (float) Math.sin(t * 5f); }
-            else if (s.equals("talking")) { col = 0xFFBA68C8; k = (float) Math.sin(t * 9f); }
-            float r = getWidth() / 2f;
-            p.setColor(col);
-            p.setAlpha(70);
-            c.drawCircle(r, r, r * (0.85f + 0.12f * k), p);
-            p.setColor(col);
-            p.setAlpha(255);
-            c.drawCircle(r, r, r * (0.42f + 0.06f * k), p);
-            postInvalidateDelayed(40);
+            float spin = 0.12f, pulse = 0f, alpha = 110f;
+            if (s.equals("listening")) { spin = 0.35f; pulse = 0.04f * (float) Math.sin(t * 2.2f); alpha = 215f; }
+            else if (s.equals("thinking")) { spin = 1.6f; pulse = 0.06f * (float) Math.sin(t * 5f); alpha = 230f; }
+            else if (s.equals("talking")) { spin = 0.7f; lv += (level - lv) * 0.35f; pulse = 0.05f * (float) Math.sin(t * 9f) + 0.30f * lv; alpha = 245f; }
+            ang += spin * dt;
+            float ca = (float) Math.cos(ang), sa = (float) Math.sin(ang);
+            float d = getResources().getDisplayMetrics().density;
+            float R = getWidth() / 2f;
+            float sc = 0.82f * (1f + pulse);
+            for (int i = 0; i < N; i++) {
+                float x = px[i] * ca + pz[i] * sa;
+                float z = -px[i] * sa + pz[i] * ca;
+                float depth = (z + 1f) / 2f;
+                p.setColor(pc[i]);
+                p.setAlpha((int) (alpha * (0.35f + 0.65f * depth)));
+                c.drawCircle(R + x * R * sc, R + py[i] * R * sc, (1.1f + 1.7f * depth) * d, p);
+            }
+            postInvalidateDelayed(33);
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
