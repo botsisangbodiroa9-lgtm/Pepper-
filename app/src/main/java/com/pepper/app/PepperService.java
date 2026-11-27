@@ -332,6 +332,7 @@ public class PepperService extends Service {
             AudioRecord a = null;
             Recognizer r = null;
             double gain = 4.0;
+            java.util.ArrayDeque<short[]> ring = new java.util.ArrayDeque<>();
             boolean wasIdle = false;
             Pattern tp = Pattern.compile("\"(?:text|partial)\"\\s*:\\s*\"([^\"]*)\"");
             while (alive) {
@@ -376,13 +377,18 @@ public class PepperService extends Service {
                     }
                     if (!state.equals("idle") || SystemClock.uptimeMillis() < voskHold) { wasIdle = false; continue; }
                     if (!wasIdle) { r.reset(); wasIdle = true; }
+                    short[] cp = new short[n];
+                    System.arraycopy(buf, 0, cp, 0, n);
+                    ring.addLast(cp);
+                    if (ring.size() > 12) ring.removeFirst();
                     String js = r.acceptWaveForm(buf, n) ? r.getResult() : r.getPartialResult();
                     Matcher m = tp.matcher(js == null ? "" : js);
                     String t = m.find() ? m.group(1).trim().toLowerCase() : "";
                     if (t.contains("pepper") || t.contains("dummy") || t.contains("buddy")) {
                         voskHold = SystemClock.uptimeMillis() + 3000;
                         voskMsg = "heard: " + t;
-                        send(t);
+                        String full = capture(a, gain, ring, t);
+                        send(full);
                         r.reset();
                     }
                 } catch (Throwable e) {
@@ -396,6 +402,40 @@ public class PepperService extends Service {
             }
             try { if (r != null) r.close(); } catch (Throwable e) { }
         }).start();
+    }
+
+    String capture(AudioRecord a, double gain, java.util.ArrayDeque<short[]> ring, String first) {
+        Recognizer rf = null;
+        try {
+            rf = new Recognizer(model, 16000.0f);
+            for (short[] blk : ring) rf.acceptWaveForm(blk, blk.length);
+            short[] b = new short[1600];
+            long end = SystemClock.uptimeMillis() + 5000;
+            Pattern tp2 = Pattern.compile("\"text\"\\s*:\\s*\"([^\"]*)\"");
+            String text = "";
+            while (SystemClock.uptimeMillis() < end && alive) {
+                int n = a.read(b, 0, b.length);
+                if (n <= 0) continue;
+                for (int i = 0; i < n; i++) {
+                    int v = (int) (b[i] * gain);
+                    b[i] = (short) Math.max(-32768, Math.min(32767, v));
+                }
+                if (rf.acceptWaveForm(b, n)) {
+                    Matcher m = tp2.matcher(rf.getResult());
+                    text = m.find() ? m.group(1).trim() : "";
+                    break;
+                }
+            }
+            if (text.isEmpty()) {
+                Matcher m = tp2.matcher(rf.getFinalResult());
+                text = m.find() ? m.group(1).trim() : "";
+            }
+            return text.length() > first.length() ? text : first;
+        } catch (Throwable e) {
+            return first;
+        } finally {
+            try { if (rf != null) rf.close(); } catch (Throwable x) { }
+        }
     }
 
     void makeOrb() {
