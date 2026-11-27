@@ -116,7 +116,6 @@ public class PepperService extends Service {
         }
         prepModel();
         voskThread();
-        interruptThread();
         h.post(tick);
         return START_STICKY;
     }
